@@ -770,7 +770,380 @@ function assembleSource(source) {
 }
 
 // Expose under prefixed names to avoid collisions with any future global scope
+
+// ── Experimental secondary emit target: x86-64 ──────────────────────────────
+// Ported directly from a separate, already-tested implementation (verified
+// there via unit tests on register aliasing, immediate ALU forms, and
+// nop-counting branch resolution) -- not reinvented. SEER's 256-deep
+// register file, connector-node branch addressing, and capability-gated
+// memory ops have no lossless x86-64 equivalent, so this is a scoped,
+// best-effort translation of the genuinely portable subset (straight-line
+// ALU/immediate-ALU/li and compare-and-branch on registers r0-r12), not a
+// claim of full equivalence. Anything outside that subset is flagged with
+// a note instead of guessed at.
+const X86_GPR_NAMES = ["rax","rcx","rdx","rbx","rsi","rdi","r8","r9","r10","r11","r12","r13","r14"];
+const X86_GPR_ENC   = [0,1,2,3,6,7,8,9,10,11,12,13,14]; // rsp(4)/rbp(5) skipped; r15(idx15) reserved as scratch
+const X86_SCRATCH_ENC = 15; // r15
+
+function x86RegInfo(seerReg, regDepth) {
+  if (seerReg === 255 || seerReg === regDepth - 1) return {zero: true};
+  if (seerReg >= 0 && seerReg < X86_GPR_NAMES.length) return {zero: false, enc: X86_GPR_ENC[seerReg], name: X86_GPR_NAMES[seerReg]};
+  return null;
+}
+function x86Rex(w, r, x, b) { return 0x40 | (w?8:0) | (r?4:0) | (x?2:0) | (b?1:0); }
+function x86ModRM(mod, reg, rm) { return ((mod&3)<<6) | ((reg&7)<<3) | (rm&7); }
+function x86Imm32LE(v) { v = v|0; return [v&0xFF,(v>>8)&0xFF,(v>>16)&0xFF,(v>>24)&0xFF]; }
+function x86RR(opcode, dstEnc, srcEnc) {
+  return [x86Rex(1, srcEnc>7, 0, dstEnc>7), opcode, x86ModRM(3, srcEnc&7, dstEnc&7)];
+}
+function x86MovImm32(dstEnc, imm) {
+  return [x86Rex(1,0,0,dstEnc>7), 0xC7, x86ModRM(3,0,dstEnc&7), ...x86Imm32LE(imm)];
+}
+function x86AluImm32(digit, dstEnc, imm) {
+  return [x86Rex(1,0,0,dstEnc>7), 0x81, x86ModRM(3,digit,dstEnc&7), ...x86Imm32LE(imm)];
+}
+function x86ShiftImm8(digit, dstEnc, imm8) {
+  return [x86Rex(1,0,0,dstEnc>7), 0xC1, x86ModRM(3,digit,dstEnc&7), imm8&0xFF];
+}
+function x86Imul3(dstEnc, srcEnc, imm) {
+  return [x86Rex(1,dstEnc>7,0,srcEnc>7), 0x69, x86ModRM(3,dstEnc&7,srcEnc&7), ...x86Imm32LE(imm)];
+}
+function x86Imul2(dstEnc, srcEnc) {
+  return [x86Rex(1,dstEnc>7,0,srcEnc>7), 0x0F, 0xAF, x86ModRM(3,dstEnc&7,srcEnc&7)];
+}
+
+const ALU_A_TO_X86 = { add:0x01, sub:0x29, and:0x21, or:0x09, xor:0x31 };
+const ALU_C_IMM_DIGIT = { addi:0, ori:1, andi:4, subi:5, xori:6 };
+const SHIFT_C_DIGIT = { slli:4, srli:5, srai:7 };
+const JCC_MAP = { jeq:0x84, jne:0x85, jlt:0x8C, jltu:0x82, jge:0x8D, jgeu:0x83 };
+
+// rd = rs1 OP rs2, always lowered via r15 scratch so any aliasing between
+// rd/rs1/rs2 (e.g. "add r3,r3,r1", extremely common) is still correct.
+function x86Emit3OpALU(op, rd, rs1, rs2, regDepth) {
+  const dst = x86RegInfo(rd, regDepth), a = x86RegInfo(rs1, regDepth), b = x86RegInfo(rs2, regDepth);
+  if (!dst || !a || !b) return null;
+  const asm = [], bytes = [];
+  const push = (t, by) => { asm.push(t); bytes.push(...by); };
+  if (a.zero) push(`xor r15, r15`, x86RR(0x31, X86_SCRATCH_ENC, X86_SCRATCH_ENC));
+  else push(`mov r15, ${a.name}`, x86RR(0x89, X86_SCRATCH_ENC, a.enc));
+  if (op in ALU_A_TO_X86) {
+    if (!b.zero) push(`${op} r15, ${b.name}`, x86RR(ALU_A_TO_X86[op], X86_SCRATCH_ENC, b.enc));
+    else if (op === "and") push(`xor r15, r15`, x86RR(0x31, X86_SCRATCH_ENC, X86_SCRATCH_ENC));
+  } else if (op === "mul") {
+    if (!b.zero) push(`imul r15, ${b.name}`, x86Imul2(X86_SCRATCH_ENC, b.enc));
+    else push(`xor r15, r15`, x86RR(0x31, X86_SCRATCH_ENC, X86_SCRATCH_ENC));
+  } else return null;
+  if (!dst.zero) push(`mov ${dst.name}, r15`, x86RR(0x89, dst.enc, X86_SCRATCH_ENC));
+  return { text: asm.join(" ; "), bytes };
+}
+
+function x86Emit3OpImm(op, rd, rs, imm, regDepth) {
+  const dst = x86RegInfo(rd, regDepth), a = x86RegInfo(rs, regDepth);
+  if (!dst || !a) return null;
+  const asm = [], bytes = [];
+  const push = (t, by) => { asm.push(t); bytes.push(...by); };
+  if (a.zero) push(`xor r15, r15`, x86RR(0x31, X86_SCRATCH_ENC, X86_SCRATCH_ENC));
+  else push(`mov r15, ${a.name}`, x86RR(0x89, X86_SCRATCH_ENC, a.enc));
+  if (op === "muli") {
+    push(`imul r15, r15, ${imm}`, x86Imul3(X86_SCRATCH_ENC, X86_SCRATCH_ENC, imm));
+  } else if (op in ALU_C_IMM_DIGIT) {
+    push(`${op.slice(0,-1)} r15, ${imm}`, x86AluImm32(ALU_C_IMM_DIGIT[op], X86_SCRATCH_ENC, imm));
+  } else if (op in SHIFT_C_DIGIT) {
+    const name = {slli:"shl",srli:"shr",srai:"sar"}[op];
+    push(`${name} r15, ${imm}`, x86ShiftImm8(SHIFT_C_DIGIT[op], X86_SCRATCH_ENC, imm & 0xFF));
+  } else return null;
+  if (!dst.zero) push(`mov ${dst.name}, r15`, x86RR(0x89, dst.enc, X86_SCRATCH_ENC));
+  return { text: asm.join(" ; "), bytes };
+}
+
+// rd = (rs1 < rs2) signed, materialized as a real 0/1 in a full 64-bit
+// register -- genuinely portable (this is exactly what x86's own SETcc +
+// MOVZX pair exists for), unlike ecall's runtime service-call semantics.
+// Goes through r15 scratch the same way the ALU ops do, for the same
+// aliasing-safety reason: SEER's slt is 3-operand, x86 SETcc only ever
+// writes a fixed byte destination, so rd/rs1/rs2 aliasing has to be
+// handled by loading first, not by writing to rd mid-sequence.
+function x86EmitSlt(rd, rs1, rs2, regDepth) {
+  const dst = x86RegInfo(rd, regDepth), a = x86RegInfo(rs1, regDepth), b = x86RegInfo(rs2, regDepth);
+  if (!dst || !a || !b) return null;
+  const asm = [], bytes = [];
+  const push = (t, by) => { asm.push(t); bytes.push(...by); };
+  if (a.zero) push(`xor r15, r15`, x86RR(0x31, X86_SCRATCH_ENC, X86_SCRATCH_ENC));
+  else push(`mov r15, ${a.name}`, x86RR(0x89, X86_SCRATCH_ENC, a.enc));
+  if (b.zero) push(`cmp r15, 0`, x86AluImm32(7, X86_SCRATCH_ENC, 0));
+  else push(`cmp r15, ${b.name}`, x86RR(0x39, X86_SCRATCH_ENC, b.enc));
+  push(`setl r15b`, [x86Rex(0,0,0,X86_SCRATCH_ENC>7), 0x0F, 0x9C, x86ModRM(3,0,X86_SCRATCH_ENC&7)]);
+  push(`movzx r15, r15b`, [x86Rex(1,X86_SCRATCH_ENC>7,0,X86_SCRATCH_ENC>7), 0x0F, 0xB6, x86ModRM(3,X86_SCRATCH_ENC&7,X86_SCRATCH_ENC&7)]);
+  if (!dst.zero) push(`mov ${dst.name}, r15`, x86RR(0x89, dst.enc, X86_SCRATCH_ENC));
+  return { text: asm.join(" ; "), bytes };
+}
+
+// Reuses this ISA's own documented rule for branch offsets (counting nops
+// between two points) to find which SOURCE LINE a branch targets --
+// independent of SEER's numeric cn_off8/16 encoding, which has no portable
+// meaning outside SEER's own CN table.
+function resolveBranchTargetLine(lines, fromLineIdx, offset) {
+  if (offset === 0) return fromLineIdx + 1;
+  const dir = offset > 0 ? 1 : -1;
+  let count = 0, i = fromLineIdx;
+  while (count < Math.abs(offset)) {
+    i += dir;
+    if (i < 0 || i >= lines.length) return null;
+    const clean = lines[i].split(";")[0].split("#")[0].trim();
+    if (/^nop\b/i.test(clean)) count++;
+  }
+  return i + 1;
+}
+
+// Minimal assembleLine equivalent -- lens.js's own assembler is
+// assembleSource/assembleInstruction (a different implementation than the
+// one this backend was originally built against), but this is all
+// x86TranslateInstr actually needs: mnem/ops/label, via THIS session's own
+// already-verified encode()/parseReg, not a reconstruction.
+function seerAssembleLineMinimal(line) {
+  const clean = line.split(";")[0].split("#")[0].trim();
+  if (!clean) return null;
+  if (clean.endsWith(":")) return { label: clean.slice(0, -1) };
+  const m = /^(\S+)\s*(.*)$/.exec(clean);
+  const mnem = m[1].toLowerCase();
+  const rest = m[2].trim();
+  const ops = rest ? rest.split(",").map(s => s.trim()).filter(Boolean) : [];
+  encode(mnem, ops); // throws on anything genuinely unassemblable -- same validation assembleLine relied on
+  return { mnem, ops };
+}
+
+// Translates one already-decoded SEER instruction into
+// {text, bytes} | {text, bytes:null, note} | {deferred:true} (branches,
+// resolved in a second pass once the whole program's x86 layout is known).
+function x86TranslateInstr(res, regDepth) {
+  const { mnem, ops } = res;
+  if (mnem === "nop") return { text: "nop", bytes: [0x90] };
+  if (mnem === "hlt") return { text: "hlt", bytes: [0xF4] };
+  if (mnem === "ret") return { text: "ret", bytes: [0xC3] };
+  if (mnem === "li") {
+    const rd = parseReg(ops[0]);
+    const dst = x86RegInfo(rd, regDepth);
+    if (!dst) return { text: `mov <reg ${rd}>, ${ops[1]}`, bytes: null, note: "register out of x86 GPR range (0-12) for this backend" };
+    if (dst.zero) return { text: "; li to zr is a no-op on hardware", bytes: [] };
+    const raw = ops[1].trim().replace(/,$/, "");
+    let v = /^[+-]?0x/i.test(raw) ? parseInt(raw,16) : (/^[+-]?0b/i.test(raw) ? parseInt(raw.replace(/0b/i,""),2) : parseInt(raw,10));
+    return { text: `mov ${dst.name}, ${v}`, bytes: x86MovImm32(dst.enc, v) };
+  }
+  if (mnem in ALU_A_TO_X86 || mnem === "mul") {
+    const r = x86Emit3OpALU(mnem, parseReg(ops[0]), parseReg(ops[1]), parseReg(ops[2]), regDepth);
+    if (!r) return { text: `${mnem} ${ops.join(", ")}`, bytes: null, note: "operand register out of x86 GPR range (0-12) for this backend" };
+    return r;
+  }
+  if (mnem === "slt") {
+    const r = x86EmitSlt(parseReg(ops[0]), parseReg(ops[1]), parseReg(ops[2]), regDepth);
+    if (!r) return { text: `${mnem} ${ops.join(", ")}`, bytes: null, note: "operand register out of x86 GPR range (0-12) for this backend" };
+    return r;
+  }
+  if (mnem === "muli" || mnem in ALU_C_IMM_DIGIT || mnem in SHIFT_C_DIGIT) {
+    const imm = parseInt(ops[2].trim().replace(/,$/,""), (/^0x/i.test(ops[2])?16:10));
+    const r = x86Emit3OpImm(mnem, parseReg(ops[0]), parseReg(ops[1]), imm, regDepth);
+    if (!r) return { text: `${mnem} ${ops.join(", ")}`, bytes: null, note: "operand register out of x86 GPR range (0-12) for this backend" };
+    return r;
+  }
+  if (mnem in JCC_MAP || mnem === "jmp") {
+    return { text: null, bytes: null, deferred: true };
+  }
+  const NO_X86 = {
+    "ld":"capability-gated load -- no x86 equivalent without giving up the capability model",
+    "ld64":"capability-gated load", "ld.s32":"capability-gated load",
+    "st":"capability-gated store", "sts32":"capability-gated store", "sts64":"capability-gated store",
+    "rdctrl":"control register", "wrctrl":"control register",
+    "use":"capability discipline construct", "lend":"capability discipline construct",
+    "bset":"bit-manipulation extension","bclr":"bit-manipulation extension","btst":"bit-manipulation extension","bflp":"bit-manipulation extension",
+    "rol":"bit-manipulation extension","ror":"bit-manipulation extension","bswap":"bit-manipulation extension","brev":"bit-manipulation extension",
+    "bext":"bit-manipulation extension","bins":"bit-manipulation extension","bperm":"bit-manipulation extension","pdep":"bit-manipulation extension",
+    "pext":"bit-manipulation extension","clmul":"bit-manipulation extension","crc32":"bit-manipulation extension","bfly":"bit-manipulation extension",
+    "fadd":"float unit op","fsub":"float unit op","fmul":"float unit op","fdiv":"float unit op","fsqrt":"float unit op",
+    "feq":"float unit op","flt":"float unit op","fmin":"float unit op","fmax":"float unit op","fabs":"float unit op","fneg":"float unit op",
+    "f2i":"float unit op","i2f":"float unit op",
+    "jmpr":"register-indirect jump (SEER's own call mechanism; no resolvable target here either)",
+    "csel":"conditional-select (needs cmov lowering, not yet implemented in this backend)",
+    "ecall":"runtime service call -- unlike the ops above, this has no *portable* x86-64 form at all: translating it means "
+      + "picking a specific OS ABI (e.g. Linux's syscall convention vs Windows') this backend doesn't choose one for you",
+  };
+  if (mnem in NO_X86) return { text: `${mnem} ${ops.join(", ")}`, bytes: null, note: NO_X86[mnem] };
+  return { text: `${mnem} ${ops.join(", ")}`, bytes: null, note: "not translated by this backend" };
+}
+
+// Standalone, DOM-free two-pass translator -- the same algorithm the
+// original renderX86Panel used, separated from its own direct DOM
+// manipulation so it can be reused as a real emit target here.
+function translateSeerToX86(src, regDepth) {
+  const lines = src.split("\n");
+
+  // Real SEER byte addresses for every line -- needed to resolve the
+  // [x86target=N] annotation resolveCnJumps() now embeds in every jump's
+  // own text (see that function's own note on why this replaced
+  // nop-counting: a real, found bug where the two used different,
+  // disagreeing models of the same offset).
+  const seerLineByteLength = (lineText) => {
+    const trimmed = lineText.trim();
+    if (!trimmed || trimmed.startsWith(";") || /:$/.test(trimmed)) return 0;
+    const codepart = trimmed.split(";")[0].trim();
+    if (!codepart) return 0;
+    const mnem = codepart.split(/[\s,]+/)[0].toLowerCase();
+    if (!(mnem in FORMAT)) return 0;
+    return FORMAT[mnem] === "OB" ? 1 : 4;
+  };
+  const seerAddrByLineIdx = [];
+  const lineIdxBySeerAddr = new Map();
+  let seerAddr = 0;
+  lines.forEach((line, i) => {
+    seerAddrByLineIdx[i] = seerAddr;
+    // Last-wins deliberately: a label line and the real instruction that
+    // follows it (e.g. a connector node's own nop) share the same address
+    // (labels are 0 bytes), and the mapping needs to point at the real
+    // instruction, not the label text that precedes it at that address.
+    lineIdxBySeerAddr.set(seerAddr, i);
+    seerAddr += seerLineByteLength(line);
+  });
+
+  const perLine = [];
+  let cursor = 0, instrCount = 0, unsupportedCount = 0;
+  lines.forEach((line, i) => {
+    const clean = line.split(";")[0].split("#")[0].trim();
+    if (!clean || clean.endsWith(":")) { perLine.push(null); return; }
+    let res;
+    try { res = seerAssembleLineMinimal(line); } catch (e) { perLine.push(null); return; }
+    if (!res || res.label) { perLine.push(null); return; }
+    // Pure compiler plumbing -- the CN-table registration prologue
+    // (wrctrl/li.pcrel/wrctrl sequences and their final scratch-register
+    // cleanup) and stack-frame setup (sp init/reserve/restore). None of
+    // this corresponds to anything the person actually wrote; it's the
+    // compiler's own bookkeeping. Excluded from every count here, not
+    // just hidden from the row list, so the summary line stays honest
+    // about what it's actually counting -- their program, not the
+    // compiler's own scaffolding around it.
+    const isPlumbing =
+      (res.mnem === "wrctrl" && (res.ops[0] === "zr" || res.ops[0] === "r247")) ||
+      (res.mnem === "li.pcrel" && res.ops[0] === "r247") ||
+      (res.mnem === "li" && (res.ops[0] === "r247" || res.ops[0] === "sp")) ||
+      (res.mnem === "addi" && res.ops[0] === "sp");
+    if (isPlumbing) { perLine.push(null); return; }
+    let x86;
+    try { x86 = x86TranslateInstr(res, regDepth); } catch (e) { x86 = { text: res.mnem, bytes: null, note: "internal error: " + e.message }; }
+    let len;
+    if (x86.deferred) len = (res.mnem === "jmp") ? 5 : 6;
+    else len = x86.bytes ? x86.bytes.length : 0;
+    perLine.push({ lineIdx: i, res, x86, offset: cursor, len });
+    cursor += len;
+    instrCount++;
+    if (!x86.deferred && !x86.bytes) unsupportedCount++;
+  });
+
+  let cursor2 = 0;
+  // Pass 2a: determine each deferred branch's resolution SHAPE (which
+  // case applies, what non-rel32 bytes it needs, its final length) and
+  // finalize every entry's offset -- deliberately NOT computing rel32
+  // here. A branch's own length never depends on where its target lands,
+  // only on which operands are zero/real -- so every offset can be
+  // finalized in one sequential pass, forward jumps included.
+  perLine.forEach(entry => {
+    if (!entry) return;
+    const { res, x86 } = entry;
+    entry.offset = cursor2;
+    if (x86.deferred) {
+      const targetMatch = /\[x86target=(\d+)\]/.exec(lines[entry.lineIdx]);
+      const targetSeerAddr = targetMatch ? parseInt(targetMatch[1], 10) : null;
+      const targetLineIdx = targetSeerAddr !== null ? lineIdxBySeerAddr.get(targetSeerAddr) : undefined;
+      entry._targetLineIdx = targetLineIdx; // resolved to a live entry reference in pass 2b, once all offsets are final
+      if (targetLineIdx === undefined) {
+        entry.shape = { kind: "flagged", note: targetMatch ? "branch target address has no corresponding x86 row (target may itself be unsupported)"
+                                                              : "no [x86target=] annotation found -- this text wasn't produced by this session's own resolveCnJumps()" };
+      } else if (res.mnem === "jmp") {
+        const link = res.ops.length >= 2 ? res.ops[1] : null;
+        entry.shape = { kind: (link && link !== "zr") ? "call" : "jmp", preambleLen: 0, jccLen: 5 };
+      } else {
+        const rs1 = parseReg(res.ops[0]), rs2 = parseReg(res.ops[1]);
+        const a = x86RegInfo(rs1, regDepth), b = x86RegInfo(rs2, regDepth);
+        if (!a || !b) {
+          entry.shape = { kind: "flagged", note: "operand register out of x86 GPR range (0-12) for this backend" };
+        } else if (a.zero && b.zero) {
+          if (res.mnem === "jeq") entry.shape = { kind: "jeq-zrzr", preambleLen: 0, jccLen: 5 };
+          else entry.shape = { kind: "flagged", note: "zr-vs-zr comparison for this mnemonic not handled by this backend" };
+        } else if (a.zero || b.zero) {
+          const realReg = a.zero ? b : a;
+          if (res.mnem !== "jeq" && res.mnem !== "jne") {
+            entry.shape = { kind: "flagged", note: "directional comparison against zr not handled by this backend (needs a JG/JLE condition code not currently mapped)" };
+          } else {
+            const cmpBytes = x86AluImm32(7, realReg.enc, 0); // /7 = CMP
+            entry.shape = { kind: "cmp-imm", cmpBytes, realReg, mnem: res.mnem, preambleLen: cmpBytes.length, jccLen: 6 };
+          }
+        } else {
+          // Both real registers. BUGFIX (this session): the original
+          // ported code used nextInstrAddr = cursor2+6 here, silently
+          // ignoring the 3-byte cmp that precedes every jcc -- Jcc's own
+          // rel32 is relative to the end of the JCC INSTRUCTION ITSELF
+          // (3 for cmp + 6 for jcc = +9), not the branch's start. Every
+          // branch that DID translate before this fix landed 3 bytes
+          // short of its real target.
+          const cmpBytes = x86RR(0x39, a.enc, b.enc);
+          entry.shape = { kind: "cmp-reg", cmpBytes, a, b, mnem: res.mnem, preambleLen: cmpBytes.length, jccLen: 6 };
+        }
+      }
+      entry.len = entry.shape.kind === "flagged" ? 0 : (entry.shape.preambleLen + entry.shape.jccLen);
+    } else {
+      entry.len = x86.bytes ? x86.bytes.length : 0;
+    }
+    cursor2 += entry.len;
+  });
+
+  // Pass 2b: every entry's offset is now final regardless of direction --
+  // compute the actual rel32 bytes for every deferred, non-flagged entry.
+  perLine.forEach(entry => {
+    if (!entry || !entry.x86.deferred) return;
+    const { res } = entry;
+    const shape = entry.shape;
+    if (shape.kind === "flagged") {
+      entry.x86 = { text: `${res.mnem} ${res.ops.join(", ")}`, bytes: null, note: shape.note };
+      return;
+    }
+    const targetEntry = perLine[entry._targetLineIdx];
+    if (!targetEntry) {
+      entry.x86 = { text: `${res.mnem} ${res.ops.join(", ")}`, bytes: null, note: "branch target line has no assembled x86 entry" };
+      return;
+    }
+    const nextInstrAddr = entry.offset + shape.preambleLen + shape.jccLen;
+    const rel = targetEntry.offset - nextInstrAddr;
+    if (shape.kind === "jmp" || shape.kind === "call") {
+      entry.x86 = { text: `${shape.kind === "call" ? "call" : "jmp"} 0x${(nextInstrAddr+rel).toString(16)}`,
+                    bytes: [shape.kind === "call" ? 0xE8 : 0xE9, ...x86Imm32LE(rel)] };
+    } else if (shape.kind === "jeq-zrzr") {
+      entry.x86 = { text: `jmp 0x${(nextInstrAddr+rel).toString(16)} ; always-true (zr==zr)`, bytes: [0xE9, ...x86Imm32LE(rel)] };
+    } else if (shape.kind === "cmp-imm") {
+      entry.x86 = { text: `cmp ${shape.realReg.name}, 0 ; j${shape.mnem.slice(1)} 0x${(nextInstrAddr+rel).toString(16)}`,
+                    bytes: [...shape.cmpBytes, 0x0F, JCC_MAP[shape.mnem], ...x86Imm32LE(rel)] };
+    } else if (shape.kind === "cmp-reg") {
+      entry.x86 = { text: `cmp ${shape.a.name}, ${shape.b.name} ; j${shape.mnem.slice(1)} 0x${(nextInstrAddr+rel).toString(16)}`,
+                    bytes: [...shape.cmpBytes, 0x0F, JCC_MAP[shape.mnem], ...x86Imm32LE(rel)] };
+    }
+  });
+
+  let totalBytes = 0;
+  const rows = [];
+  perLine.forEach(entry => {
+    if (!entry) return;
+    totalBytes += entry.len;
+    rows.push({
+      srcLine: lines[entry.lineIdx].trim(),
+      offset: entry.offset,
+      text: entry.x86.text,
+      bytes: entry.x86.bytes,
+      note: entry.x86.note || null,
+    });
+  });
+
+  return { rows, instrCount, totalBytes, unsupportedCount };
+}
+
+
 window.seerDisasm         = disasm;
+window.translateSeerToX86 = translateSeerToX86;
 window.seerAssembleSource = assembleSource;
 window.seerEncode         = encode;
 window.seerInstrLength    = instrLength;
@@ -1133,11 +1506,15 @@ class SEEREmitter {
     }
 
     // Real byte addresses for every registered node, needed for the
-    // registration prologue's own li.pcrel computations. Walked AFTER
-    // patching every jump above, so every line is now real, final
-    // instruction text (not a placeholder) with a well-defined length.
+    // registration prologue's own li.pcrel computations, AND for embedding
+    // a real target address into each jump's own text below (see that
+    // step's own note on why). Computed BEFORE jump text is patched -- a
+    // CN_JUMP_PLACEHOLDER line is always exactly 4 bytes in this ISA
+    // (every jmp/BR-format instruction is), so this doesn't need to wait
+    // for the placeholder to become real text.
     const lineByteLength = (lineText) => {
       const trimmed = lineText.trim();
+      if (trimmed === '; CN_JUMP_PLACEHOLDER') return 4;
       if (!trimmed || trimmed.startsWith(';') || /:$/.test(trimmed)) return 0;
       const codepart = trimmed.split(';')[0].trim();
       if (!codepart) return 0;
@@ -1151,6 +1528,36 @@ class SEEREmitter {
       if (nodeByLineIdx.has(i)) nodeByLineIdx.get(i).addr = addr;
       addr += lineByteLength(this.lines[i]);
     }
+    const totalPrologueLen = this.cnNodes.length * 12 + 4; // 12 bytes/node (stage+li.pcrel+commit) + final cleanup
+
+    // Resolve every jump's offset now that every node has a final slot AND
+    // a final address. The offset (for real SEER execution) is exactly as
+    // before -- but ALSO embeds the target's real, final byte address
+    // (post-prologue) as a plain, parseable comment fragment. This isn't
+    // decorative: it's this session's OWN answer to a real bug found while
+    // building the x86-64 lens -- that backend's independent attempt to
+    // re-derive branch targets by counting nops in the text used a
+    // different (local, linear) model than this function's actual
+    // (global-slot vs local-position) one, and silently produced wrong
+    // targets for any backward jump. Embedding the real answer directly,
+    // from the one place that's already simulator-verified correct, means
+    // nothing downstream has to re-derive -- and can't independently
+    // disagree.
+    for (const jump of this.cnJumps) {
+      const target = this.cnNodeByName.get(jump.targetName);
+      if (!target || target.slot === undefined) {
+        throw new Error(`internal error: jump target "${jump.targetName}" was referenced but never registered via label()`);
+      }
+      const off = target.slot - jump.positionAtThisPoint;
+      if (off < 0) {
+        throw new Error(`internal geometry error: jump to "${jump.targetName}" resolved to a negative CN offset `
+          + `(${off}) -- a codegen construct is counting connector nodes inconsistently between fall-through `
+          + `and jump-only arrivals. This is a compiler bug, not a program error.`);
+      }
+      const targetRealAddr = totalPrologueLen + target.addr;
+      this.lines[jump.lineIdx] = `${jump.mnem} ${jump.r1}, ${jump.r2}, ${off}`
+        + (jump.comment ? `  ; ${jump.comment}` : '') + ` [x86target=${targetRealAddr}]`;
+    }
 
     // ── Registration prologue ──────────────────────────────────────────────
     // Mirrors cfGenerateSetup exactly: per node, in slot order, stage +
@@ -1163,8 +1570,6 @@ class SEEREmitter {
     const CTRL_STAGE = 14, CTRL_COMMIT = 15;
     const BYTES_PER_NODE = 12;
     const orderedNodes = [...this.cnNodes].sort((a, b) => a.slot - b.slot);
-    const totalRegistrationLen = orderedNodes.length * BYTES_PER_NODE;
-    const totalPrologueLen = totalRegistrationLen + 4; // + the final "li r247, 0" cleanup
 
     const prologueLines = [];
     orderedNodes.forEach((node, i) => {
@@ -2733,6 +3138,11 @@ const LensTranspiler = (() => {
 
   function transpile(source, langId, opts) {
     if (langId === 'seer') return compileSEER(source, opts);
+    if (langId === 'x86-64') {
+      const seerText = compileSEER(source, opts);
+      const x86Result = translateSeerToX86(seerText, (opts && opts.maxRegs) || 240);
+      return { seerText, x86Result };
+    }
     const lang = LANGS[langId];
     if (!lang) return `// Unknown lens: ${langId}`;
     try {
@@ -3162,6 +3572,7 @@ const ReverseTranspiler = (() => {
       <option value="typescript">TypeScript</option>
       <option value="pseudocode">Pseudocode</option>
       <option value="seer">SEER Assembly</option>
+      <option value="x86-64">x86-64 (experimental)</option>
     </select>
     <div id="seer-reg-wrap" style="display:none;align-items:center;gap:5px;margin-left:6px">
       <span style="font-family:monospace;font-size:10px;color:#4b5563;white-space:nowrap">Regs:</span>
@@ -3203,9 +3614,10 @@ const ReverseTranspiler = (() => {
   let seerMaxRegs = 240;
 
   function updateSeerSlider() {
-    const showSeer = (lensLang === 'seer' && lensOpen);
-    seerRegWrap.style.display = showSeer ? 'flex' : 'none';
-    lensHwToggle.style.display = showSeer ? '' : 'none';
+    const showRegs = ((lensLang === 'seer' || lensLang === 'x86-64') && lensOpen);
+    const showHw = (lensLang === 'seer' && lensOpen);
+    seerRegWrap.style.display = showRegs ? 'flex' : 'none';
+    lensHwToggle.style.display = showHw ? '' : 'none';
   }
 
   seerRegSlider.addEventListener('input', () => {
@@ -3559,7 +3971,7 @@ const ReverseTranspiler = (() => {
   let lensMode    = 'forward';  // 'forward' = IVX→lang, 'import' = user pasted foreign code
 
   // ── Helpers ─────────────────────────────────────────────────────────────────
-  const LANG_LABELS = { python: 'Python', javascript: 'JavaScript', typescript: 'TypeScript', pseudocode: 'Pseudocode', seer: 'SEER Assembly' };
+  const LANG_LABELS = { python: 'Python', javascript: 'JavaScript', typescript: 'TypeScript', pseudocode: 'Pseudocode', seer: 'SEER Assembly', 'x86-64': 'x86-64' };
   const IMPORT_SUPPORTED = new Set(['python', 'javascript', 'typescript']);
 
   function escHtmlLens(s) {
@@ -3739,8 +4151,56 @@ const ReverseTranspiler = (() => {
     return lines.join('\n');
   }
 
+  function renderX86Lens(x86Result) {
+    const lines = [];
+    for (const row of x86Result.rows) {
+      if (row.bytes) {
+        const hex = row.bytes.map(b => b.toString(16).toUpperCase().padStart(2,'0')).join(' ');
+        lines.push(
+          `<div class="seer-row" title="${escHtmlLens(row.srcLine)} \u2192 ${escHtmlLens(row.text)}">` +
+          `<span class="seer-addr" style="color:#4a5568">+${row.offset.toString(16).padStart(4,'0')}</span>` +
+          `<div class="seer-pills"><span class="seer-pill" style="background:#1c2128;color:#7dd3fc;border:1px solid #2a3f5f">${escHtmlLens(hex)}</span></div>` +
+          `<span class="seer-mnem" style="color:#9ca3af;font-size:10px">${escHtmlLens(row.srcLine)} \u2192 ${escHtmlLens(row.text)}</span>` +
+          `</div>`
+        );
+      } else {
+        lines.push(
+          `<div class="seer-row seer-error-row" title="${escHtmlLens(row.note || 'not translated')}">` +
+          `<span class="seer-addr" style="color:#4a5568">--</span>` +
+          `<span class="seer-mnem" style="color:#e05c5c;font-size:10px">${escHtmlLens(row.srcLine)}</span>` +
+          `<span style="color:#e05c5c;font-size:10px;margin-left:8px">${escHtmlLens(row.note || 'not translated')}</span>` +
+          `</div>`
+        );
+      }
+    }
+    const summary = `<div style="color:#6b7280;font-size:11px;margin-top:8px;padding-top:8px;border-top:1px solid #2a2a3e">`
+      + `${x86Result.instrCount} instruction(s) considered, ${x86Result.totalBytes} x86-64 bytes emitted`
+      + (x86Result.unsupportedCount ? `, ${x86Result.unsupportedCount} line(s) not translated (flagged above, no bytes guessed)` : '')
+      + `</div>`;
+    return lines.join('') + summary;
+  }
+
   function renderLens() {
     if (!lensOpen) return;
+    if (lensLang === 'x86-64') {
+      const { seerText, x86Result } = LensTranspiler.transpile(srcEl.value, 'x86-64', { maxRegs: seerMaxRegs });
+      lensCode.innerHTML = renderX86Lens(x86Result);
+      updateGutter(seerText.split('\n').length, null);
+      lensGutter.parentElement.style.display = 'none';
+      lensTitleEl.textContent = x86Result.unsupportedCount > 0
+        ? `x86-64 (${x86Result.unsupportedCount} line(s) not translated)`
+        : `x86-64 (${x86Result.totalBytes} bytes)`;
+      lensTitleEl.classList.toggle('seer-active', false);
+      lensPanel.classList.toggle('seer-mode', true);
+      lensImportWrap.style.display = 'none';
+      lensStubCount.textContent = '';
+      lensConfirm.style.display = 'none';
+      lensMode   = 'forward';
+      lensEdited = false;
+      window._seerLineAddresses = null;
+      if (typeof updateHighlight === 'function') updateHighlight();
+      return;
+    }
     const code = lensLang === 'seer'
       ? LensTranspiler.transpile(srcEl.value, 'seer', { maxRegs: seerMaxRegs })
       : LensTranspiler.transpile(srcEl.value, lensLang);
