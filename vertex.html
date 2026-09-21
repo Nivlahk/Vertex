@@ -5496,6 +5496,9 @@ if (typeof window !== 'undefined') {
   // the on-screen keyboard over the code every time recording stops.
   const IS_TOUCH = window.matchMedia('(pointer: coarse)').matches;
   const IS_NARROW = window.matchMedia('(max-width: 600px)').matches;
+  // Mobile speech engines return cumulative results -- see onresult.
+  const IS_MOBILE_SPEECH = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+    || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1); // iPadOS reports as a Mac
 
   // ── Monaco Editor: loaded from CDN via its own AMD loader, exactly like
   // any real Monaco integration (it is a large multi-file library and
@@ -6367,10 +6370,32 @@ if (typeof window !== 'undefined') {
         // (all-caps like 'RGB' is left alone). Chunks are also joined with
         // a space, since some platforms don't start chunks with one and the
         // last word of one chunk would glue onto the first of the next.
+        //
+        // Mobile Chrome (Android, and iOS) doesn't split results the way
+        // desktop does: each new result REPEATS everything heard so far
+        // ("make", "make total", "make total zero"...). Concatenating them
+        // re-types the whole utterance on every word. So on mobile, a
+        // result whose words start with everything collected so far (or
+        // with the previous result) REPLACES that text instead of adding
+        // to it. Desktop keeps plain concatenation -- there, two separate
+        // results that happen to start alike ("print x", "print x plus
+        // one") are genuinely two things said.
+        const parts = [];
+        const wordsOf = (t) => t.toLowerCase().replace(/[.,!?;:]/g, '').split(/\s+/).filter(Boolean);
+        const startsWithWords = (a, b) => b.length > 0 && b.length <= a.length && b.every((w, k) => a[k] === w);
         for (let i = 0; i < e.results.length; i++) {
-          const chunk = e.results[i][0].transcript.replace(/^(\s*)([A-Z][a-z]+)\b/, (m, ws, word) => ws + word.toLowerCase());
-          transcript += (transcript ? ' ' : '') + chunk;
+          const chunk = e.results[i][0].transcript.trim().replace(/^([A-Z][a-z]+)\b/, (m, word) => word.toLowerCase());
+          if (!chunk) continue;
+          if (IS_MOBILE_SPEECH && parts.length > 0) {
+            const w = wordsOf(chunk);
+            if (startsWithWords(w, wordsOf(parts.join(' ')))) { parts.length = 0; parts.push(chunk); continue; }
+            const last = wordsOf(parts[parts.length - 1]);
+            if (startsWithWords(w, last)) { parts[parts.length - 1] = chunk; continue; }
+            if (startsWithWords(last, w)) continue; // a shorter repeat of what's already there
+          }
+          parts.push(chunk);
         }
+        transcript = parts.join(' ');
         const allWords = applyHomophones(transcript).split(/\s+/).filter(Boolean);
         const segmentWords = allWords.slice(committedWordCount);
         let result = applySpokenEditWords(segmentWords, baseIndentLevel, baseOpenStack, baseItName, baseFunNames);
