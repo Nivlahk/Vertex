@@ -116,6 +116,25 @@
   .msg.info .bubble { background: transparent; border: none; color: var(--muted); font-size: 12px; padding: 2px 0; }
   .msg.prompt { align-self: flex-end; }
   .msg.prompt .bubble { background: var(--accent); color: #0d1117; border-color: var(--accent); font-weight: 600; }
+  /* Run divider: a plain rule between one run's output and the next -- no text. */
+  .run-divider { height: 1px; background: var(--border); margin: 6px 0; flex-shrink: 0; }
+  /* 'take' bubble: an inline request for input, in the console thread --
+     replaces window.prompt(), which blocks the whole tab and looks nothing
+     like the rest of the UI. */
+  .take-bubble { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+  .take-label { white-space: nowrap; }
+  .take-input {
+    flex: 1 1 80px; min-width: 60px; font: inherit; font-weight: 400; color: #0d1117;
+    background: rgba(13, 17, 23, 0.12); border: 1px solid rgba(13, 17, 23, 0.35);
+    border-radius: 6px; padding: 6px 8px;
+  }
+  .take-input::placeholder { color: rgba(13, 17, 23, 0.55); }
+  .take-send {
+    font: inherit; font-weight: 700; color: #0d1117; background: rgba(13, 17, 23, 0.12);
+    border: 1px solid rgba(13, 17, 23, 0.35); border-radius: 6px; padding: 6px 12px; cursor: pointer;
+  }
+  .take-send:active { background: rgba(13, 17, 23, 0.22); }
+  .msg.take-answered .bubble { font-weight: 600; }
 </style>
 </head>
 <body>
@@ -1955,9 +1974,17 @@ function opResultType(op, left, right) {
 
   // Arithmetic operators
   if (['+', '-', '*', '%'].includes(op)) {
-    if (left === TYPE.STRING && op === '+') {
-      // String concatenation
-      if (right === TYPE.STRING) return TYPE.STRING;
+    if (op === '+' && (left === TYPE.STRING || right === TYPE.STRING)) {
+      // String concatenation. A side whose type isn't resolved yet --
+      // UNKNOWN, which is what every MemberAccess returns, including a
+      // super.method() call -- is assumed compatible rather than
+      // rejected, matching compatible()'s own "unknown defers" rule.
+      // Without this, 'give super.speak() + "!"' was rejected outright,
+      // even though it runs fine: the typechecker can't see through
+      // 'super', so it never gets the chance to confirm the string.
+      if ((left === TYPE.STRING || left === TYPE.UNKNOWN) && (right === TYPE.STRING || right === TYPE.UNKNOWN)) {
+        return TYPE.STRING;
+      }
       return null;
     }
     if ([TYPE.INTEGER, TYPE.FLOAT, TYPE.NONE, TYPE.UNKNOWN].includes(left) &&
@@ -2313,20 +2340,33 @@ class TypeChecker {
 
   _checkClassStmt(node, env) {
     const initMethod = (node.body ?? []).find(stmt => stmt?.type === 'Fun' && stmt.name === 'init');
-    env.defClass(
-      node.name,
-      (initMethod?.params ?? []).map(param => ({ name: typeof param === "string" ? param : param.name, type: TYPE.UNKNOWN })),
-      TYPE.DICT
-    );
+    let ctorParams = (initMethod?.params ?? []).map(param => ({ name: typeof param === "string" ? param : param.name, type: TYPE.UNKNOWN }));
+    let superclass = null;
+    if (node.superclass) {
+      superclass = env.lookupClass(node.superclass.name);
+      if (!superclass) {
+        this.err(`Superclass '${node.superclass.name}' is not defined`, node.superclass);
+      } else if (!initMethod) {
+        // No init() of its own -- the constructor it actually runs is the
+        // superclass's (see IVXClass.instantiate, which walks
+        // resolveMethod('init') up the chain), so arity should be checked
+        // against THAT signature instead of assuming zero arguments.
+        ctorParams = superclass.params;
+      }
+    }
+    env.defClass(node.name, ctorParams, TYPE.DICT);
     const classEnv = env.child('class-' + node.name);
     classEnv.define('self', TYPE.DICT);
     if (node.superclass) {
-      const superclass = env.lookupClass(node.superclass.name);
-      if (!superclass) {
-        this.err(`Superclass '${node.superclass.name}' is not defined`, node.superclass);
-      }
       classEnv.define('super', TYPE.DICT);
     }
+    // Constructor params are in scope for bare statements in the class
+    // body (outside any 'fun') too, not just inside 'init' itself -- the
+    // interpreter runs those against the same per-instance scope the
+    // constructor arguments were bound to (see IVXClass.instantiate's
+    // initStmts loop), so e.g. 'init(w, h)' followed by
+    // 'make self.area w * h' is meant to see w and h.
+    for (const p of ctorParams) classEnv.define(p.name, p.type);
     this.checkBlock(node.body ?? [], classEnv);
   }
 
@@ -5434,15 +5474,6 @@ if (typeof window !== 'undefined') {
   const clearBtn = document.getElementById('clearBtn');
   const micBtn = document.getElementById('micBtn');
 
-  const INITIAL_SOURCE = [
-    'make total 0',
-    'loop 5',
-    '    make total total + i',
-    '    print total',
-    '',
-    'if total = 10',
-    '    say "done counting"',
-  ].join('\n');
 
   // ── Console rendered as a message thread ────────────────────────────
   function timestamp() {
@@ -5466,6 +5497,64 @@ if (typeof window !== 'undefined') {
     }
     consoleEl.appendChild(row);
     consoleEl.scrollTop = consoleEl.scrollHeight;
+  }
+
+  // A plain grey rule marking where one Run ends and the next begins --
+  // no "Run" text, nobody needs to be told that's what it is.
+  function addDivider() {
+    const line = document.createElement('div');
+    line.className = 'run-divider';
+    consoleEl.appendChild(line);
+    consoleEl.scrollTop = consoleEl.scrollHeight;
+  }
+
+  // 'take <name>' asks for input INLINE, in the console thread, instead of
+  // window.prompt() (which blocks the whole tab behind an OS-styled box
+  // that looks nothing like the rest of the UI, and on some mobile
+  // browsers doesn't reliably show at all). Renders as its own bubble
+  // with a text field + Send; resolves once the person answers, and then
+  // that bubble freezes into a plain read-only line showing what they typed.
+  function addTakePrompt(name) {
+    return new Promise((resolve) => {
+      const row = document.createElement('div');
+      row.className = 'msg prompt';
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble take-bubble';
+      const label = document.createElement('span');
+      label.className = 'take-label';
+      label.textContent = name;
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'take-input';
+      input.autocomplete = 'off';
+      input.autocapitalize = 'off';
+      input.spellcheck = false;
+      const send = document.createElement('button');
+      send.type = 'button';
+      send.className = 'take-send';
+      send.textContent = 'Send';
+      bubble.appendChild(label);
+      bubble.appendChild(input);
+      bubble.appendChild(send);
+      row.appendChild(bubble);
+      consoleEl.appendChild(row);
+      consoleEl.scrollTop = consoleEl.scrollHeight;
+      input.focus();
+
+      let answered = false;
+      function finish() {
+        if (answered) return; // Enter and a click on Send can both fire
+        answered = true;
+        const val = input.value;
+        label.textContent = name + ' \u2192 ' + (val ? val : '(empty)');
+        input.remove();
+        send.remove();
+        row.classList.add('take-answered');
+        resolve(val);
+      }
+      send.addEventListener('click', finish);
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') finish(); });
+    });
   }
 
   clearBtn.addEventListener('click', () => { consoleEl.innerHTML = ''; });
@@ -5577,7 +5666,7 @@ if (typeof window !== 'undefined') {
     });
 
     const editor = monaco.editor.create(document.getElementById('editorContainer'), {
-      value: INITIAL_SOURCE,
+      value: '',
       language: 'vertex',
       theme: 'vertex-dark',
       automaticLayout: true,
@@ -5603,18 +5692,23 @@ if (typeof window !== 'undefined') {
         hideCursorInOverviewRuler: true,
       } : {}),
     });
+    // Always '\n' line endings. An EMPTY model otherwise takes the OS
+    // default, which on Windows is '\r\n' -- and voice input measures the
+    // text it just inserted by string length (one char per '\n'), so on
+    // Windows every line break left one stray character behind, and each
+    // update piled old fragments up below the cursor. (With the old demo
+    // program pre-filled, Monaco detected '\n' from its text instead, which
+    // is why this only showed up once the editor started blank.)
+    editor.getModel().setEOL(monaco.editor.EndOfLineSequence.LF);
 
     async function runProgram() {
       openConsole(); // also stops any recording in progress
       runBtn.disabled = true;
-      addMessage('Run', 'prompt');
+      if (consoleEl.children.length > 0) addDivider(); // none before the very first run
       const interp = new Interpreter({
         onOutput: (v) => addMessage(ivxRepr(v), 'out'),
         onError: (e) => addMessage((e && e.message) ? e.message : String(e), 'err'),
-        onInput: (name) => {
-          const val = window.prompt('take ' + name + ':');
-          return val === null ? '' : val;
-        },
+        onInput: (name) => addTakePrompt(name),
       });
       try {
         await interp.run(editor.getValue());
@@ -6474,7 +6568,6 @@ if (typeof window !== 'undefined') {
       }
     });
 
-    addMessage('Vertex ready. Run ▶ or Cmd/Ctrl+Enter to execute.', 'info');
   });
 })();
 </script>
