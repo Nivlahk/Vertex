@@ -70,13 +70,33 @@ body,#app{background:#fff}
 .rc,.card,.alt{box-shadow:0 1px 3px rgba(0,46,93,.05)}
 .later span{background:#f5f7f9}
 
+
+.mapwrap{overflow:hidden;touch-action:none}
+svg#map{touch-action:none;cursor:grab}
+svg#map.dragging{cursor:grabbing}
+.mapcontrols{position:absolute;right:12px;top:70px;z-index:3;display:grid;gap:6px}
+.mapcontrols button{width:42px;height:42px;border:1px solid var(--line);background:#fff;color:var(--navy);border-radius:8px;font-size:21px;font-weight:700;box-shadow:0 1px 5px #0002}
+.sheet{transition:flex-basis .22s ease,border-radius .22s ease}
+.sheetHandle{position:sticky;top:0;z-index:5;background:#fff;padding:7px 0 5px;display:flex;justify-content:center;touch-action:none;cursor:ns-resize}
+.sheetHandle:before{content:"";display:block;width:42px;height:5px;border-radius:5px;background:#c6ccd2}
+.sheet.expanded{flex:1 1 auto;min-height:0;border-radius:14px 14px 0 0;box-shadow:0 -3px 12px rgba(0,46,93,.08)}
+.sheet.expanded .sheetHandle{border-radius:14px 14px 0 0}
+.mapwrap.sheet-open{flex-basis:92px!important;min-height:92px}
+.mapwrap.sheet-open svg,.mapwrap.sheet-open .mapcontrols,.mapwrap.sheet-open .top{opacity:0;pointer-events:none}
+.mapwrap.sheet-open .back{opacity:1}
+
 </style>
 </head>
 <body>
 <div id="app">
   <header class="byuhead"><span class="byumark">BYU</span><span class="rydetitle">The Ryde</span></header>
   <div class="mapwrap" id="mapwrap">
-    <svg id="map" viewBox="0 0 400 520" preserveAspectRatio="xMidYMid slice" role="img" aria-label="Map of Ryde shuttle routes"></svg>
+    <svg id="map" viewBox="0 0 400 520" preserveAspectRatio="xMidYMid slice" role="img" aria-label="Interactive map of Ryde shuttle routes"></svg>
+    <div class="mapcontrols" aria-label="Map controls">
+      <button id="zoomIn" aria-label="Zoom in">+</button>
+      <button id="zoomOut" aria-label="Zoom out">−</button>
+      <button id="fitMap" aria-label="Fit route">⌖</button>
+    </div>
     <div class="top" id="top">
       <label class="search"><span aria-hidden="true">🔍</span><input id="q" type="search" placeholder="Search route, stop or destination" aria-label="Search routes"></label>
       <button class="fab" id="locate" aria-label="Center on my location">◎</button>
@@ -100,6 +120,18 @@ const R=[
 const USER={x:150,y:352}; // user location (near Route 11 stop)
 const $=id=>document.getElementById(id);
 const svg=$("map"),sheet=$("sheet"),q=$("q");
+
+const addSheetHandle=()=>{
+  if(sheet.querySelector(".sheetHandle"))return;
+  const h=document.createElement("div");h.className="sheetHandle";h.setAttribute("role","button");
+  h.setAttribute("tabindex","0");h.setAttribute("aria-label","Show or hide full shuttle list");
+  sheet.prepend(h);
+};
+const setSheetExpanded=v=>{
+  sheet.classList.toggle("expanded",v);
+  $("mapwrap").classList.toggle("sheet-open",v);
+};
+
 const now=new Date();
 const clock=m=>{const t=new Date(now.getTime()+m*6e4);let h=t.getHours(),mi=String(t.getMinutes()).padStart(2,"0");return`${h%12||12}:${mi} ${h<12?"AM":"PM"}`};
 const lvl=r=>{const p=r.riders/r.cap;return p<.45?["Plenty of seats","var(--ok)"]:p<.8?["Filling up","var(--mid)"]:["Nearly full","var(--bad)"]};
@@ -129,7 +161,7 @@ function buildMap(){
   el("circle",{r:7,fill:"var(--blue)",stroke:"#fff","stroke-width":3},gUser);
 }
 function showRoutes(ids,dim){R.forEach(r=>{gRoutes[r.id].style.display=ids.includes(r.id)?"":"none";gRoutes[r.id].style.opacity=dim&&dim!==r.id&&ids.includes(r.id)?.35:1})}
-function view(x,y,w){const h=w*1.3;svg.setAttribute("viewBox",`${x} ${y} ${w} ${h}`)}
+function view(x,y,w){const h=w*1.3;svg.setAttribute("viewBox",`${x} ${y} ${w} ${h}`);if(typeof vb!=="undefined"){vb={x,y,w,h}}}
 function fit(r){const b=r.path.getBBox();const w=Math.max(b.width+90,(b.height+90)/1.3);view(b.x+b.width/2-w/2,b.y+b.height/2-w*.65,w)}
 
 /* ---- screens ---- */
@@ -159,8 +191,21 @@ function home(filter=""){
      <div class="t"><span class="big">${r.dep[0]} min</span><span class="sub">${clock(r.dep[0])}</span></div>
      <span class="badge" style="--k:${c}"><span class="dot"></span>${r.live?t:"Live info unavailable"}</span></button>
     <button class="more" data-more="${r.id}" aria-expanded="false">Later times ▾</button>
-    <div class="later" id="l${r.id}">${r.dep.slice(1).map(m=>`<span>${clock(m)}</span>`).join("")}</div></div>`}).join("")+`</div>`}
-  sheet.innerHTML=h;
+    <div class="later" id="l${r.id}">${r.dep.slice(1).map(m=>`<span>${clock(m)}</span>`).join("")}</div></div>`}).join("")+`</div>
+<div class="pad">
+  <h2>All shuttle routes</h2>
+  ${list.map(r=>{const [t,c]=lvl(r);return `<button class="alt" style="--c:${r.color}" data-open="${r.id}">
+    <div><b>${r.name}</b><div class="sub">${r.dest.replace("Campus: ","")}</div></div>
+    <div style="margin-left:auto;text-align:right"><b>${r.dep[0]} min</b><div class="badge" style="--k:${c}"><span class="dot"></span>${r.live?t:"Scheduled"}</div></div>
+  </button>`}).join("")}
+  <h2>Service information</h2>
+  <div class="card">
+    <div class="row"><div><b>Live bus locations</b><div class="sub">Select a route to see its bus, stops, crowding, and arrival information.</div></div></div>
+    <div class="row"><div><b>Upcoming departures</b><div class="sub">Tap “Later times” on any shuttle above to compare upcoming departures.</div></div></div>
+    <div class="row" style="border:0"><div><b>Prototype data</b><div class="sub">Times, crowding, and bus positions shown here are simulated for usability testing.</div></div></div>
+  </div>
+</div>`}
+  sheet.innerHTML=h;addSheetHandle();
 }
 function detail(id){
   sel=R.find(r=>r.id==id);const r=sel;layout(2);
@@ -176,7 +221,7 @@ function detail(id){
    <button class="cta" id="go">Take this route</button>
    <h2>Other ways to get to campus</h2>
    ${alts.map(a=>{const [at,ac]=lvl(a);return`<button class="alt" style="--c:${a.color}" data-open="${a.id}"><div><b>${a.name}</b><div class="sub">${a.dest.replace("Campus: ","")}</div></div><div style="margin-left:auto;text-align:right"><b>${a.dep[0]} min</b><div class="badge" style="--k:${ac}"><span class="dot"></span>${a.live?at:"No live info"}</div></div></button>`}).join("")}
-  </div>`;
+  </div>`;addSheetHandle();
 }
 function live(){
   const r=sel;layout(3);showRoutes([r.id]);lostSignal=false;
@@ -205,7 +250,7 @@ function live(){
    <div id="lostmsg" class="notice hide" role="status"><span aria-hidden="true">⚠️</span><span>Live bus information is currently unavailable. Showing scheduled times only; next scheduled arrival is ${clock(r.dep[0])}.</span></div>
    ${r.live?crowdHTML(r):""}
    <button class="ghost" id="sim">Simulate lost signal</button>
-   <button class="ghost" id="end">End trip</button></div>`;
+   <button class="ghost" id="end">End trip</button></div>`;addSheetHandle();
   $("sim").onclick=()=>{lostSignal=!lostSignal;$("sim").textContent=lostSignal?"Restore signal":"Simulate lost signal";upd()};
   $("end").onclick=()=>{lostSignal=false;home()};
   upd();
@@ -226,6 +271,50 @@ $("back").onclick=()=>screen==3?detail(sel.id):home(q.value);
 sheet.addEventListener("click",e=>{if(e.target.id=="go")live()});
 q.addEventListener("input",()=>home(q.value));
 $("locate").onclick=()=>{view(USER.x-90,USER.y-120,180);setTimeout(()=>view(0,0,400),1800)};
+
+/* ---- interactive map pan / zoom ---- */
+let vb={x:0,y:0,w:400,h:520}, mapDrag=false,mx=0,my=0,startVB=null;
+const applyVB=()=>svg.setAttribute("viewBox",`${vb.x} ${vb.y} ${vb.w} ${vb.h}`);
+const syncVB=()=>{const a=svg.getAttribute("viewBox").split(/\s+/).map(Number);vb={x:a[0],y:a[1],w:a[2],h:a[3]}};
+const zoom=f=>{
+ syncVB();const nw=Math.max(120,Math.min(520,vb.w*f)),nh=nw*1.3;
+ vb.x+= (vb.w-nw)/2;vb.y+=(vb.h-nh)/2;vb.w=nw;vb.h=nh;applyVB();
+};
+$("zoomIn").onclick=()=>zoom(.78);
+$("zoomOut").onclick=()=>zoom(1.28);
+$("fitMap").onclick=()=>{if(sel)fit(sel);else view(0,0,400);syncVB()};
+svg.addEventListener("pointerdown",e=>{
+ mapDrag=true;svg.classList.add("dragging");svg.setPointerCapture?.(e.pointerId);
+ mx=e.clientX;my=e.clientY;syncVB();startVB={...vb};
+});
+svg.addEventListener("pointermove",e=>{
+ if(!mapDrag)return;
+ const r=svg.getBoundingClientRect();
+ vb.x=startVB.x-(e.clientX-mx)*startVB.w/r.width;
+ vb.y=startVB.y-(e.clientY-my)*startVB.h/r.height;
+ applyVB();
+});
+const endMapDrag=e=>{mapDrag=false;svg.classList.remove("dragging");try{svg.releasePointerCapture?.(e.pointerId)}catch{}};
+svg.addEventListener("pointerup",endMapDrag);svg.addEventListener("pointercancel",endMapDrag);
+
+/* ---- pull-up shuttle sheet ---- */
+let sheetDrag=false,sy=0;
+sheet.addEventListener("pointerdown",e=>{
+ if(!e.target.closest(".sheetHandle"))return;
+ sheetDrag=true;sy=e.clientY;sheet.setPointerCapture?.(e.pointerId);
+});
+sheet.addEventListener("pointerup",e=>{
+ if(!sheetDrag)return;sheetDrag=false;
+ const dy=e.clientY-sy;
+ if(Math.abs(dy)<18)setSheetExpanded(!sheet.classList.contains("expanded"));
+ else setSheetExpanded(dy<0);
+});
+sheet.addEventListener("pointercancel",()=>sheetDrag=false);
+sheet.addEventListener("keydown",e=>{
+ if(!e.target.closest(".sheetHandle"))return;
+ if(e.key==="Enter"||e.key===" "){e.preventDefault();setSheetExpanded(!sheet.classList.contains("expanded"))}
+});
+
 buildMap();home();
 </script>
 </body>
