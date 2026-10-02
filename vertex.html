@@ -4669,10 +4669,16 @@ for (const m of ['ask', '_executePost', '_executeGet', '_evalAskExpr', '_evalShe
     // covers with the newly recomputed text -- so each update REPLACES the
     // live guess in place rather than appending another copy of it.
     const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const IS_MOBILE_SPEECH = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
     let recognizer = null;
     let listening = false;
     let anchorOffset = 0;    // fixed character offset where dictation started
     let lastInsertLen = 0;   // length of the text currently occupying that anchor
+    let liveTranscriptDecorationId = null; // tracked range for the current
+                                           // interim transcript; this is the
+                                           // authoritative replacement span
+    let jevPromptDecorationId = null; // tracked range for only the Jev
+                                      // placeholder, never the preceding code
     let baseIndentLevel = 0; // indent depth (in 4-space units) of the anchor line
     let committedWordCount = 0; // how many words (from the session's homophone-
                                  // corrected word list) belong to an EARLIER
@@ -4680,6 +4686,10 @@ for (const m of ['ask', '_executePost', '_executeGet', '_evalAskExpr', '_evalShe
                                  // reprocessed against the current one -- see
                                  // the 'line <N>' handling below for why this
                                  // exists instead of restarting the recognizer.
+    let latestTranscriptWordCount = 0; // full recognized word count at the
+                                       // latest onresult event; used to mark
+                                       // live dictation consumed when Jev
+                                       // moves the anchor.
     let firedRunCount = 0;      // how many 'run' words (within the CURRENT
                                  // segment only) have already clicked Run
     let baseOpenStack = [];     // brackets already open at the anchor -- see openBracketsAtOffset
@@ -5215,14 +5225,81 @@ for (const m of ['ask', '_executePost', '_executeGet', '_evalAskExpr', '_evalShe
       return startOffset;
     }
 
+    function clearLiveTranscriptDecoration() {
+      if (liveTranscriptDecorationId) {
+        editor.deltaDecorations([liveTranscriptDecorationId], []);
+        liveTranscriptDecorationId = null;
+      }
+    }
+
+    function clearJevPromptDecoration() {
+      if (jevPromptDecorationId) {
+        editor.deltaDecorations([jevPromptDecorationId], []);
+        jevPromptDecorationId = null;
+      }
+    }
+
+    function trackJevPromptSuffix(prefixLength) {
+      const model = editor.getModel();
+      const liveRange = liveTranscriptDecorationId
+        ? model.getDecorationRange(liveTranscriptDecorationId)
+        : null;
+      if (!liveRange) {
+        clearJevPromptDecoration();
+        return;
+      }
+      const liveStart = model.getOffsetAt({
+        lineNumber: liveRange.startLineNumber,
+        column: liveRange.startColumn,
+      });
+      const liveEnd = model.getOffsetAt({
+        lineNumber: liveRange.endLineNumber,
+        column: liveRange.endColumn,
+      });
+      const promptStart = Math.min(liveEnd, liveStart + prefixLength);
+      const promptRange = new monaco.Range(
+        model.getPositionAt(promptStart).lineNumber,
+        model.getPositionAt(promptStart).column,
+        liveRange.endLineNumber,
+        liveRange.endColumn
+      );
+      clearJevPromptDecoration();
+      [jevPromptDecorationId] = editor.deltaDecorations([], [{
+        range: promptRange,
+        options: { stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges },
+      }]);
+    }
+
     function applyLiveTranscript(transcript) {
       const model = editor.getModel();
-      const startPos = model.getPositionAt(anchorOffset);
-      const endPos = model.getPositionAt(anchorOffset + lastInsertLen);
+      const trackedRange = liveTranscriptDecorationId
+        ? model.getDecorationRange(liveTranscriptDecorationId)
+        : null;
+      const startPos = trackedRange
+        ? { lineNumber: trackedRange.startLineNumber, column: trackedRange.startColumn }
+        : model.getPositionAt(anchorOffset);
+      const endPos = trackedRange
+        ? { lineNumber: trackedRange.endLineNumber, column: trackedRange.endColumn }
+        : model.getPositionAt(anchorOffset + lastInsertLen);
       const range = new monaco.Range(startPos.lineNumber, startPos.column, endPos.lineNumber, endPos.column);
+      const startOffset = model.getOffsetAt(startPos);
       editor.executeEdits('voice-input', [{ range, text: transcript, forceMoveMarkers: true }]);
       lastInsertLen = transcript.length;
-      const newPos = model.getPositionAt(anchorOffset + transcript.length);
+      anchorOffset = startOffset;
+      const newEnd = model.getPositionAt(startOffset + transcript.length);
+      const newRange = new monaco.Range(startPos.lineNumber, startPos.column, newEnd.lineNumber, newEnd.column);
+      if (transcript) {
+        [liveTranscriptDecorationId] = editor.deltaDecorations(
+          liveTranscriptDecorationId ? [liveTranscriptDecorationId] : [],
+          [{
+            range: newRange,
+            options: { stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges },
+          }]
+        );
+      } else {
+        clearLiveTranscriptDecoration();
+      }
+      const newPos = newEnd;
       editor.setPosition(newPos);
       editor.revealPositionInCenterIfOutsideViewport(newPos);
     }
@@ -5239,6 +5316,7 @@ for (const m of ['ask', '_executePost', '_executeGet', '_evalAskExpr', '_evalShe
     // the SAME recognition session (see committedWordCount above).
     function reanchorAt(offset) {
       const model = editor.getModel();
+      clearLiveTranscriptDecoration();
       anchorOffset = offset;
       lastInsertLen = 0;
       baseIndentLevel = indentLevelAtOffset(model, anchorOffset);
@@ -5257,6 +5335,7 @@ for (const m of ['ask', '_executePost', '_executeGet', '_evalAskExpr', '_evalShe
     const JEV_MODEL = 'jev-latest';
     const JEV_API_KEY = ''; // add the Jev/TypeSafe API key manually
     const JEV_CHOICE_LIMIT = 255;
+    const JEV_PLACEHOLDER_MARKER = '/* 🤖 asking Jev:';
 
     function numberedSource(source) {
       return source.split('\n').map((line, index) =>
@@ -5369,33 +5448,59 @@ for (const m of ['ask', '_executePost', '_executeGet', '_evalAskExpr', '_evalShe
     // has ended. The placeholder is removed before the result is applied.
     // A Monaco decoration tracks the placeholder through edits made while
     // the network request is in flight.
+    function isJevPlaceholderRange(model, range) {
+      if (!range) return false;
+      return model.getValueInRange(range).includes(JEV_PLACEHOLDER_MARKER);
+    }
+
+    function clearJevPlaceholderSafely() {
+      const model = editor.getModel();
+      const promptRange = jevPromptDecorationId
+        ? model.getDecorationRange(jevPromptDecorationId)
+        : null;
+      if (isJevPlaceholderRange(model, promptRange)) {
+        editor.executeEdits('voice-input', [{ range: promptRange, text: '', forceMoveMarkers: true }]);
+      }
+      clearJevPromptDecoration();
+    }
+
     function finalizeLinePrompt(prompt) {
       const model = editor.getModel();
-      const startPos = model.getPositionAt(anchorOffset);
-      const endPos = model.getPositionAt(anchorOffset + lastInsertLen);
-      const range = new monaco.Range(startPos.lineNumber, startPos.column, endPos.lineNumber, endPos.column);
-      const [decorationId] = editor.deltaDecorations([], [{
-        range,
-        options: {
-          // Do not let words dictated after "submit" become part of the
-          // placeholder range. They must survive while Jev is deciding.
-          stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
-        },
-      }]);
-      const startOffset = model.getOffsetAt({ lineNumber: range.startLineNumber, column: range.startColumn });
-      const endOffset = model.getOffsetAt({ lineNumber: range.endLineNumber, column: range.endColumn });
+      const promptRange = jevPromptDecorationId
+        ? model.getDecorationRange(jevPromptDecorationId)
+        : null;
+      const range = promptRange && isJevPlaceholderRange(model, promptRange) ? promptRange : null;
+      const hasSafePlaceholder = !!range;
+      clearJevPromptDecoration();
       const withPlaceholder = model.getValue();
-      const sourceAtRequest = withPlaceholder.slice(0, startOffset) + withPlaceholder.slice(endOffset);
+      let decorationId = null;
+      let sourceAtRequest = withPlaceholder;
+      if (hasSafePlaceholder) {
+        [decorationId] = editor.deltaDecorations([], [{
+          range,
+          options: {
+            // Do not let words dictated after "submit" become part of the
+            // placeholder range. They must survive while Jev is deciding.
+            stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+          },
+        }]);
+        const startOffset = model.getOffsetAt({ lineNumber: range.startLineNumber, column: range.startColumn });
+        const endOffset = model.getOffsetAt({ lineNumber: range.endLineNumber, column: range.endColumn });
+        sourceAtRequest = withPlaceholder.slice(0, startOffset) + withPlaceholder.slice(endOffset);
+      } else {
+        addMessage('Jev placeholder range was unavailable; preserving the file contents.', 'err');
+      }
 
       addMessage('Sending to Jev for a line: ' + (prompt || '(empty request)'), 'info');
       chooseLineWithJev(prompt, sourceAtRequest).then((result) => {
-        const currentRange = model.getDecorationRange(decorationId);
-        editor.deltaDecorations([decorationId], []);
-        if (!currentRange) {
-          linePromptDispatched = false;
-          return;
+        const currentRange = decorationId ? model.getDecorationRange(decorationId) : null;
+        if (decorationId) editor.deltaDecorations([decorationId], []);
+        // The placeholder is only visual bookkeeping. If Monaco lost the
+        // decoration while speech was still editing, do not throw away a
+        // valid Jev answer just because that optional range is unavailable.
+        if (isJevPlaceholderRange(model, currentRange)) {
+          editor.executeEdits('jev-line', [{ range: currentRange, text: '', forceMoveMarkers: true }]);
         }
-        editor.executeEdits('jev-line', [{ range: currentRange, text: '', forceMoveMarkers: true }]);
         if (!result.line) {
           linePromptDispatched = false;
           addMessage('Jev line lookup failed: ' + result.error, 'err');
@@ -5405,14 +5510,21 @@ for (const m of ['ask', '_executePost', '_executeGet', '_evalAskExpr', '_evalShe
         const pos = { lineNumber: line, column: 1 };
         editor.setPosition(pos);
         editor.revealLineInCenter(line);
+        // Words spoken after "submit" may already have been rendered at the
+        // old anchor while Jev was deciding. They are now part of the live
+        // editor content, so mark the entire recognition history consumed;
+        // otherwise the next onresult replays those words at the new line.
+        committedWordCount = Math.max(committedWordCount, latestTranscriptWordCount);
         reanchorAt(model.getOffsetAt(pos));
         linePromptDispatched = false;
         const confidence = Number.isFinite(result.confidence) ? ` (${Math.round(result.confidence * 100)}% confidence)` : '';
         addMessage('Jev selected line ' + line + confidence + '.', 'info');
       }).catch((e) => {
-        const currentRange = model.getDecorationRange(decorationId);
-        editor.deltaDecorations([decorationId], []);
-        if (currentRange) editor.executeEdits('jev-line', [{ range: currentRange, text: '', forceMoveMarkers: true }]);
+        const currentRange = decorationId ? model.getDecorationRange(decorationId) : null;
+        if (decorationId) editor.deltaDecorations([decorationId], []);
+        if (isJevPlaceholderRange(model, currentRange)) {
+          editor.executeEdits('jev-line', [{ range: currentRange, text: '', forceMoveMarkers: true }]);
+        }
         linePromptDispatched = false;
         addMessage('Jev line lookup failed: ' + (e && e.message ? e.message : String(e)), 'err');
       });
@@ -5442,6 +5554,7 @@ for (const m of ['ask', '_executePost', '_executeGet', '_evalAskExpr', '_evalShe
 
       reanchorAt(editor.getModel().getOffsetAt(editor.getPosition()));
       committedWordCount = 0;
+      latestTranscriptWordCount = 0;
       firedRunCount = 0;
       pendingLinePrompt = null;
       linePromptSubmitted = false;
@@ -5470,36 +5583,37 @@ for (const m of ['ask', '_executePost', '_executeGet', '_evalAskExpr', '_evalShe
         // a space, since some platforms don't start chunks with one and the
         // last word of one chunk would glue onto the first of the next.
         //
-        // Some Chrome/platform combinations report an evolving best guess
-        // as several result items. Keep all finalized chunks, but retain
-        // only the newest non-final chunk so revisions like "what's",
-        // "what's happening", "what's happening now" and "what's happen"
-        // cannot be concatenated into duplicate source text.
-        const finalParts = [];
-        let interimChunk = '';
+        // Mobile Chrome reports each new result as a longer repeat of the
+        // same utterance. Desktop Chrome reports separate finalized chunks.
+        // Match docvex: deduplicate the mobile form, but otherwise preserve
+        // every result item and render the current live transcript on every
+        // event so speech is not delayed until a pause.
+        const parts = [];
         const wordsOf = (t) => t.toLowerCase().replace(/[.,!?;:]/g, '').split(/\s+/).filter(Boolean);
         const startsWithWords = (a, b) => b.length > 0 && b.length <= a.length && b.every((w, k) => a[k] === w);
         for (let i = 0; i < e.results.length; i++) {
           const resultItem = e.results[i];
           const chunk = resultItem[0].transcript.trim().replace(/^([A-Z][a-z]+)\b/, (m, word) => word.toLowerCase());
           if (!chunk) continue;
-          if (resultItem.isFinal) finalParts.push(chunk);
-          else interimChunk = chunk; // keep only the newest evolving guess
-        }
-        if (interimChunk) {
-          const finalized = finalParts.join(' ');
-          const interimWords = wordsOf(interimChunk);
-          const finalizedWords = wordsOf(finalized);
-          // A few implementations include finalized words in the interim
-          // transcript too. In that case the interim revision supersedes
-          // the duplicated final prefix rather than being appended to it.
-          if (startsWithWords(interimWords, finalizedWords)) {
-            finalParts.length = 0;
+          if (IS_MOBILE_SPEECH && parts.length > 0) {
+            const w = wordsOf(chunk);
+            if (startsWithWords(w, wordsOf(parts.join(' ')))) {
+              parts.length = 0;
+              parts.push(chunk);
+              continue;
+            }
+            const last = wordsOf(parts[parts.length - 1]);
+            if (startsWithWords(w, last)) {
+              parts[parts.length - 1] = chunk;
+              continue;
+            }
+            if (startsWithWords(last, w)) continue;
           }
-          finalParts.push(interimChunk);
+          parts.push(chunk);
         }
-        transcript = finalParts.join(' ');
+        transcript = parts.join(' ');
         const allWords = applyHomophones(transcript).split(/\s+/).filter(Boolean);
+        latestTranscriptWordCount = allWords.length;
         const segmentWords = allWords.slice(committedWordCount);
         let result = applySpokenEditWords(segmentWords, baseIndentLevel, baseOpenStack, baseItName, baseFunNames);
         if (result.excessBacks > firedBackCount) {
@@ -5530,9 +5644,11 @@ for (const m of ['ask', '_executePost', '_executeGet', '_evalAskExpr', '_evalShe
           pendingLinePrompt = linePrompt;
           if (submitLinePrompt) linePromptSubmitted = true;
           applyLiveTranscript(text + '/* \u{1F916} asking Jev: ' + linePrompt + '… */');
+          trackJevPromptSuffix(text.length);
         } else {
           pendingLinePrompt = null;
           linePromptSubmitted = false;
+          clearJevPromptDecoration();
           applyLiveTranscript(text);
         }
         if (submitLinePrompt && !linePromptDispatched) {
@@ -5594,7 +5710,7 @@ for (const m of ['ask', '_executePost', '_executeGet', '_evalAskExpr', '_evalShe
             finalizeLinePrompt(prompt);
           } else {
             linePromptSubmitted = false;
-            applyLiveTranscript('');
+            clearJevPlaceholderSafely();
             addMessage('Line lookup canceled; say "submit" when the request is complete.', 'info');
           }
         }
